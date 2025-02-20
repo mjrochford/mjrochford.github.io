@@ -1,7 +1,7 @@
 #+TITLE: Learning way too much GLib GObject Introspection
 #+SUBTITLE: Down the rabbit hole on over-tweaking dotfiles
 #+AUTHOR: Matt Rochford
-#+DRAFT: true
+#+DRAFT: false
 #+DATE: Tue Feb 18 17:18:29 PST 2025
 * Learning too much about GObject Introspection
 ** the hard way
