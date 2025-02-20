@@ -1,0 +1,532 @@
+#+TITLE: Learning way too much GLib GObject Introspection
+#+SUBTITLE: Down the rabbit hole on over-tweaking dotfiles
+#+AUTHOR: Matt Rochford
+#+DRAFT: true
+#+DATE: Tue Feb 18 17:18:29 PST 2025
+* Learning too much about GObject Introspection
+** the hard way
+
+I use a linux desktop. What this means for day to day tasks is not much different
+than other platforms. However it does mean one thing when it comes to my free time
+being absorbed by endlessly tweaking my configs for my different programs, referred to
+as dotfiles in the linux world [fn:1]. I've had the linux affliction for many years now
+and it has spread to my desktop pc my laptops and I've even considered getting phones
+compatible with mobile linux operating systems (Android doesn't count, even though
+technically it is linux).
+
+
+All this preamble to say I really enjoy testing out new
+programs and their subsequent configuration options, and rely on many programs and
+my associated accumulated tweaks to their default configurations stored in a dedicated
+git repo, replete with scripts to automagically install links to the source control
+versions inside the default config directories. All in service to making starting up
+in a brand new environment as painless as possible. I suppose I caught this bug when
+first switching to linux and the associated process of distro hopping around to find
+which flavor of linux suited my tastes [fn:2].
+
+
+For some programs this approach is fantastic allowing me to remote into a fresh server,
+or, image a new laptop and clone my dotfiles
+repos run my install scripts and be all set with a shell that feels like home, an editor
+with all my keybinds, and all my other programs that I use. However some programs, are
+much less amicable to this approach. For most command line oriented applications config
+files are typically well documented and backwards compatible allowing this approach to
+suit these types of applications well. When it comes to some other applications, i.e.
+web browsers, desktop managers, and others they overload the responsibilities of their
+configuration directories, putting session data such as cookies inside the config
+directories making adding one of these applications cumbersome and with the layout
+of the directories or the format of the config files subject to change across versions 
+it has been more work than I was willing to support as I get 85% of the way to functional
+environment just focusing on the subset of apps that are relativly easy to automagically
+configure. Falling back to manually configuring those few programs on that 15%.
+
+
+However, for some inane reason I've decided to try and bring that number up to 90% by
+automatically configuring xfce. There are a few reasons why I suspected xfce would be
+well suited to this. First it is a particularly mature DE, and is subject to less config
+drift than something undergoing more aggressive development such as KDE. Second it has
+a mechanism for configuration xfconf. Which is really just a way of assigning values to
+path like things under "channels" which are kind of like configuration categories. 
+
+
+Xfconf comes with a program ~xfconf-query~ which allows inspecting and setting these values.
+
+#+name: xfconf-query-ex-usage
+#+begin_src console
+mrochford @ ~/.dotfiles $ xfconf-query -l
+Channels:
+  displays
+  keyboard-layout
+  keyboards
+  pointers
+  ...
+  xfwm4
+  xsettings
+mrochford @ ~/.dotfiles $ xfconf-query --verbose -c xfwm4 -l
+/general/activate_action                 bring
+/general/borderless_maximize             true
+/general/box_move                        false
+/general/box_resize                      false
+  ...
+#+end_src
+
+Easy enough to use, with a little shell we can dump out all the configuration options
+
+#+name: dump-xfconf.sh
+#+begin_src sh
+  for c in $(xfconf-query -l); do xfconf-query --verbose -c $c -l; done
+#+end_src
+
+#+name: dump-xfconf-runtime
+#+begin_src console
+mrochford @ ~/.dotfiles $ time for c in $(xfconf-query -l); do xfconf-query --verbose -c $c -l; done > /dev/null
+
+real    0m0.274s
+user    0m0.130s
+sys     0m0.077s
+#+end_src 
+
+Actually the first version looked more like this before I learned about the verbose option [fn:3]
+
+#+begin_src console
+mrochford @ ~/.dotfiles $ time for c in $(xfconf-query -l); do
+for p in $(xfconf-query -c $c -l); do
+  xfconf-query -c $c -p $p;
+done; done > /dev/null
+
+real    0m6.506s
+user    0m2.521s
+sys     0m2.385s
+#+end_src 
+
+unacceptable we must go deeper, lets rip out some code from xfconf-query and just compile the
+subset of the functionality we need.
+
+#+name: xfconf-dump.c
+#+begin_src c
+// gcc `pkg-config --cflags --libs libxfconf-0` -o dump-xfconf dump-xfconf.c
+/**
+ * TAKEN FROM xfconf-query/main.c
+ */
+#include <xfconf/xfconf.h>
+
+static gint
+xfconf_query_compare_func(gconstpointer a,
+                          gconstpointer b,
+                          gpointer user_data)
+{
+    gchar **s = (gchar **)a;
+    gchar **t = (gchar **)b;
+    return g_strcmp0(*s, *t);
+}
+
+static void
+xfconf_query_list_sorted(gpointer key, gpointer value, gpointer user_data)
+{
+    GSList **listp = user_data;
+
+    *listp = g_slist_insert_sorted(*listp, key, (GCompareFunc)g_utf8_collate);
+}
+
+gchar *
+_xfconf_string_from_gvalue(GValue *val)
+{
+    g_return_val_if_fail(val && G_VALUE_TYPE(val), NULL);
+
+    switch (G_VALUE_TYPE(val)) {
+        case G_TYPE_STRING:
+            return g_value_dup_string(val);
+        case G_TYPE_UCHAR:
+            return g_strdup_printf("%u", (guint)g_value_get_uchar(val));
+        case G_TYPE_CHAR:
+            return g_strdup_printf("%d", g_value_get_schar(val));
+        case G_TYPE_UINT:
+            return g_strdup_printf("%u", g_value_get_uint(val));
+        case G_TYPE_INT:
+            return g_strdup_printf("%d", g_value_get_int(val));
+        case G_TYPE_UINT64:
+            return g_strdup_printf("%" G_GUINT64_FORMAT,
+                                   g_value_get_uint64(val));
+        case G_TYPE_INT64:
+            return g_strdup_printf("%" G_GINT64_FORMAT,
+                                   g_value_get_int64(val));
+        case G_TYPE_FLOAT:
+            return g_strdup_printf("%f", (gdouble)g_value_get_float(val));
+        case G_TYPE_DOUBLE:
+            return g_strdup_printf("%f", g_value_get_double(val));
+        case G_TYPE_BOOLEAN:
+            return g_strdup(g_value_get_boolean(val) ? "true" : "false");
+        default:
+            if (G_VALUE_TYPE(val) == XFCONF_TYPE_UINT16) {
+                return g_strdup_printf("%u",
+                                       (guint)xfconf_g_value_get_uint16(val));
+            } else if (G_VALUE_TYPE(val) == XFCONF_TYPE_INT16) {
+                return g_strdup_printf("%d",
+                                       (gint)xfconf_g_value_get_int16(val));
+            }
+            break;
+    }
+
+    g_warning("Unable to convert GValue to string");
+    return NULL;
+}
+
+static void
+xfconf_query_list_contents(GSList *sorted_contents, GHashTable *channel_contents, gint size)
+{
+    GSList *li;
+    gchar *format = g_strdup_printf("%%-%ds=%%s\n", size + 2);
+    GValue *property_value;
+    gchar *string;
+
+    for (li = sorted_contents; li != NULL; li = li->next) {
+        property_value = g_hash_table_lookup(channel_contents, li->data);
+
+        if (G_TYPE_PTR_ARRAY != G_VALUE_TYPE(property_value)) {
+            string = _xfconf_string_from_gvalue(property_value);
+        } else {
+            GPtrArray *arr = g_value_get_boxed(property_value);
+            gchar **strv = g_new0(gchar *, arr->len + 1);
+            gchar *str;
+
+            for (guint i = 0; i < arr->len; ++i) {
+                GValue *item_value = g_ptr_array_index(arr, i);
+                strv[i] = _xfconf_string_from_gvalue(item_value);
+            }
+            str = g_strjoinv(",", strv);
+            string = g_strdup_printf("[%s]", str);
+            g_free(str);
+            g_strfreev(strv);
+        }
+
+        g_print(format, (gchar *)li->data, string);
+        g_free(string);
+    }
+
+    g_free(format);
+}
+int main() {
+    gchar **channels;
+    GError *error = NULL;
+    if (!xfconf_init(&error)) {
+        g_print("Failed to init libxfconf: %s", error->message);
+        g_error_free(error);
+        return EXIT_FAILURE;
+    }
+
+    channels = xfconf_list_channels();
+    if (G_LIKELY(channels)) {
+        g_qsort_with_data(channels, g_strv_length(channels), sizeof(gchar *), xfconf_query_compare_func, NULL);
+    } else {
+        xfconf_shutdown();
+        return EXIT_FAILURE;
+    }
+
+    for (gint i = 0; channels[i]; ++i) {
+        g_print("\n%s\n\n", channels[i]);
+        XfconfChannel *channel = xfconf_channel_new(channels[i]);
+        GHashTable *channel_contents = xfconf_channel_get_properties(channel, "/");
+
+        if (channel_contents) {
+            gint size = 0;
+            GSList *sorted_contents = NULL;
+
+            g_hash_table_foreach(channel_contents, 
+                    (GHFunc)xfconf_query_list_sorted, &sorted_contents);
+
+            xfconf_query_list_contents(sorted_contents, channel_contents, size);
+
+            g_slist_free(sorted_contents);
+            g_hash_table_destroy(channel_contents);
+        } else {
+            g_print("Channel \"%s\" contains no properties", channels[i]);
+            g_print(".\n");
+        }
+        g_object_unref(channel);
+    }
+
+    g_strfreev(channels);
+    xfconf_shutdown();
+    return EXIT_SUCCESS;
+}
+#+end_src
+
+#+begin_src console
+mrochford @ ~/.dotfiles $ gcc `pkg-config --cflags --libs libxfconf-0` -o dump-xfconf dump-xfconf.c
+mrochford @ ~/.dotfiles $ time ./dump-xfconf > /dev/null
+
+real    0m0.111s
+user    0m0.069s
+sys     0m0.009s
+#+end_src
+
+Much better however we also might want to extend this with features i.e. only track certain
+channels and properties, as some properties are hardware dependent, make sure icons/fonts are
+installed, etc... we might not want to write all these features in c just to make our future
+lives a bit easier when we come back to this that it is not just a random c application in our
+dotfiles repo. I.e. maybe we don't have access to a C compiler, not a real reason because if
+we have xfce we probably have a c compiler but I digress. Follow me down this rabbit hold
+
+
+Enter GObject and GObject Introspection... libxfconf-0 is also available as a GObject Introspection
+library, with api descriptions in a Xfconf-0.gir and Xfconf-0.typelib files which are generated
+by g-ir-scanner and g-ir-compiler by reading source and headers of our files and the annotations
+of our exported functions. Well, this seems like a good route lets write some guile scheme, which
+I know has a [[https://github.com/spk121/guile-gi][gi library]]
+
+#+name: gi.scm
+#+begin_src scheme
+(use-modules (ice-9 format)
+	     (srfi srfi-26)
+	     (srfi srfi-43)
+             ((gi) #:prefix gi:)
+             (gi types)
+             (gi repository))
+
+(require "GLib")
+(load-by-name "GLib" "log_set_debug_enabled")
+(require "Xfconf" "0")
+(map (cute load-by-name "Xfconf" <>)
+	  '("init" "shutdown" "list_channels" "Channel"))
+(if (init?)
+    (begin
+      (let ((channels (vector-map
+		       (lambda (_ x) (channel:get x))
+		       (list-channels))))
+	(log-set-debug-enabled #t)
+	(vector-for-each
+	 (lambda (_ c)
+	   (write (channel:channel-name c))
+	   (newline)
+	   (write (get-properties c #f))
+	   (newline))
+	 channels))
+      (shutdown))
+    (format #t "Couldn't init xfconf~%"))
+#+end_src
+
+#+begin_src console
+mrochford @ ~/tmp $ guile-3.0 gi.scm
+  ...
+"._cfg0000_xfce4-session"
+(process:351628): GuileGI-DEBUG: 14:00:29.864: [S2C] On line 186 while handing pointer to gchararray or NULL of channel:get-properties.
+  ...
+(process:351628): GuileGI-DEBUG: 14:00:29.865: [C2S] On line 1274 while handing GValue of type GBoxed of channel:get-properties.
+(process:351628): GuileGI-DEBUG: 14:00:29.865: gig_type_transfer_object(GValue, 0x5581182f9520, 0)
+(process:351628): GuileGI-DEBUG: 14:00:29.865: boxed_copy(GValue, 0x5581182f9520)
+Segmentation fault (core dumped)
+mrochford @ ~/tmp $ 
+#+end_src 
+
+...hmm. Now a sane person at this point would give up and go write a shell script with the functionality
+that is needed and accept the performance penalty of running so many xfconf-query processes. Yet I am
+mentally ill. Why is this segfaulting. we must go deeper.
+
+#+begin_src console
+Thread 1 "guile-3.0" received signal SIGSEGV, Segmentation fault.
+g_type_value_table_peek (
+    type=type@entry=<error reading variable: Cannot access memory at address 0x6e6f697373657354>)
+    at ../glib-2.80.5/gobject/gtype.c:4356
+4356      if (node && NODE_REFCOUNT (node) && node->mutatable_check_cache)
+#+end_src
+
+...hmm that memory address its accessing is suspicious
+
+#+begin_src python
+  In [1]: ith_char = lambda s, i : (s & (0xff << (8 * i))) >> (8 * i)
+
+  In [2]: "".join([chr(ith_char(0x6e6f697373657354, i)) for i in range(8)])
+  Out[2]: 'Tsession'
+#+end_src
+
+very suspicious indeed. Lets inspect the backtrace until we find some relevant functions.
+
+#+begin_src console
+(gdb) bt
+#0  g_type_value_table_peek
+    (type=type@entry=<error reading variable: Cannot access memory at address 0x6e6f697373657354>)
+    at ../glib-2.80.5/gobject/gtype.c:4356
+#1  0x00007fffe42159df in g_value_init
+    (value=value@entry=0x5555555d7100, g_type=<error reading variable: Cannot access memory at address 0x6e6f697373657354>) at ../glib-2.80.5/gobject/gvalue.c:89
+#2  0x00007fffe41e9858 in value_copy (src_value=0x5555555d6590)
+    at ../glib-2.80.5/gobject/gboxed.c:51
+#3  0x00007fffe42baeda in _boxed_copy
+    (cif=<optimized out>, ret=ret@entry=0x7fffffffc830, ffi_args=ffi_args@entry=0x7fffffffc6a0, user_data=user_data@entry=0x555555593600)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_type_private.c:11
+  ...
+#6  0x00007fffe42b95f6 in gig_type_transfer_object
+    (type=<optimized out>, ptr=0x5555555d6590, transfer=GI_TRANSFER_NOTHING)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_type.c:177
+#7  0x00007fffe42a9c0d in c_boxed_to_scm
+    (subr=0x55555559b480 "channel:get-properties", argpos=-1, meta=0x7fffffffca30, arg=0x7fffffffc9f8, object=0x7fffffffca68, size=18446744073709551615)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_argument.c:1291
+#8  gig_argument_c_to_scm
+    (subr=0x55555559b480 "channel:get-properties", argpos=-1, meta=0x7fffffffca30, arg=0x7fffffffc9f8, object=0x7fffffffca68, size=18446744073709551615)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_argument.c:1178
+#9  0x00007fffe42aa4f9 in c_ghashtable_to_scm
+    (size=<optimized out>, subr=0x55555559b480 "channel:get-properties", argpos=-1, meta=0x55555559b2f8, arg=<optimized out>, object=<optimized out>)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_argument.c:1681
+#10 c_boxed_to_scm
+    (subr=0x55555559b480 "channel:get-properties", argpos=-1, meta=0x55555559b2f8, arg=<optimized out>, object=<optimized out>, size=<optimized out>)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_argument.c:1289
+#11 gig_argument_c_to_scm
+    (subr=0x55555559b480 "channel:get-properties", argpos=-1, meta=0x55555559b2f8, arg=<optimized out>, object=<optimized out>, size=<optimized out>)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_argument.c:1178
+#12 0x00007fffe42b4d4f in gig_callable_return_value
+    (amap=0x55555559b2c0, name=0x55555559b480 "channel:get-properties", self=0x5555555b2220 [XfconfChannel], ok=<optimized out>, return_arg=<optimized out>, cinvoke_input_arg_array=0x7fffcc01ca30, cinvoke_output_arg_array=0x7fffcc018a40, cinvoke_free_array=0x7fffcc01a340, out_args=0x0, out_boxes=0x0, args=<optimized out>)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_function.c:517
+#13 0x00007fffe42b50a9 in function_invoke
+    (func_info=<optimized out>, amap=0x55555559b2c0, name=0x55555559b480 "channel:get-properties", self=0x5555555b2220 [XfconfChannel], args=<optimized out>, error=<optimized out>)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_function.c:577
+  ...
+#33 0x00007ffff7f1307c in scm_with_guile () at /usr/lib64/libguile-3.0.so.1
+#34 0x00007ffff7eabf96 in scm_boot_guile () at /usr/lib64/libguile-3.0.so.1
+#35 0x00005555555551af in main ()
+#+end_src
+
+overload of information yes, but from this we can glean that channel:get-properties is invoked by
+the guile-gi runtime and its crashing... also remember that c code we stole.
+
+#+begin_src c
+  // from before [xfconf-dump.c]
+  GHashTable *channel_contents = xfconf_channel_get_properties(channel, "/");
+  // and its function declaration and documentation w/annotations
+  /**
+   * xfconf_channel_get_properties:
+   * @channel: An #XfconfChannel.
+   * @property_base: (nullable): The base property name of properties to retrieve.
+   *
+   * Retrieves multiple properties from @channel and stores
+   * them in a #GHashTable in which the keys correspond to
+   * the string (gchar *) property names, and the values
+   * correspond to variant (GValue *) values.  The keys and
+   * values are owned by the hash table and should be copied
+   * if needed.  The value of the property specified by
+   * @property_base (if it exists) and all sub-properties are
+   * retrieved.  To retrieve all properties in the channel,
+   * specify "/" or %NULL for @property_base.
+   *
+   * Returns: (element-type utf8 GValue) (transfer container): A newly-allocated #GHashTable, which should be freed with
+   *          g_hash_table_destroy() when no longer needed.
+   */
+  GHashTable *
+  xfconf_channel_get_properties(XfconfChannel *channel,
+                                const gchar *property_base);
+#+end_src
+
+the guile-gi runtime tries its best to convert this return value (element-type utf8 GValue) (transfer container)
+into a native guile scheme value.
+
+~c_ghashtable_to_scm~ piques my interest lets read the source
+
+#+begin_src c
+static void
+c_ghashtable_to_scm(C2S_ARG_DECL)
+{
+    TRACE_C2S();
+    GHashTable *hash = arg->v_pointer;
+    GHashTableIter iter;
+    gpointer key, value;
+
+    *object = scm_c_make_hash_table(g_hash_table_size(hash));
+
+    g_hash_table_iter_init(&iter, hash);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        SCM keyval[2];
+        for (int i = 0; i < 2; i++) {
+            GigTypeMeta _meta = meta->params[i];
+            GIArgument _arg;
+            gpointer p = ((i == 0) ? key : value);
+
+            c_hash_pointer_to_arg(&_meta, p, &_arg);
+
+            gsize _size = GIG_ARRAY_SIZE_UNKNOWN;
+            gig_argument_c_to_scm(subr, argpos, &_meta, &_arg, &keyval[i], _size);
+        }
+        scm_hash_set_x(*object, keyval[0], keyval[1]);
+    }
+    if (meta->transfer != GI_TRANSFER_NOTHING)
+        g_hash_table_unref(hash);
+}
+#+end_src
+
+The crash occurs right after a ~boxed_copy~ of a ~GValue~ while trying to transfer the values of the
+properties hashtable which are of type ~GValue~ to a scheme value, inside of the function
+~gig_argument_c_to_scm~.
+
+#+begin_src console
+(process:351628): GuileGI-DEBUG: 14:00:29.865: gig_type_transfer_object(GValue, 0x5581182f9520, 0)
+(process:351628): GuileGI-DEBUG: 14:00:29.865: boxed_copy(GValue, 0x5581182f9520)
+Segmentation fault (core dumped)
+#+end_src
+
+#+begin_src console
+(gdb) up
+  ...
+(gdb) up
+#9  0x00007fffe42aa4f9 in c_ghashtable_to_scm (size=<optimized out>, 
+    subr=0x55555559b480 "channel:get-properties", argpos=-1, meta=0x55555559b2f8, 
+    arg=<optimized out>, object=<optimized out>)
+    at /usr/src/debug/dev-scheme/guile-gi-0.3.2-r100/guile-gi-0.3.2/src/gig_argument.c:1681
+1681                gig_argument_c_to_scm(subr, argpos, &_meta, &_arg, &keyval[i], _size);
+(gdb) p *(GValue*)value
+$1 = {g_type = 0x14 [gboolean], data = {{v_int = 1, v_uint = 1, v_long = 1, v_ulong = 1, 
+      v_int64 = 1, v_uint64 = 1, v_float = 1.40129846e-45, v_double = 4.9406564584124654e-324, 
+      v_pointer = 0x1}, {v_int = 0, v_uint = 0, v_long = 0, v_ulong = 0, v_int64 = 0, v_uint64 = 0, 
+      v_float = 0, v_double = 0, v_pointer = 0x0}}}
+(gdb) p (char*)key
+$2 = 0x5555555d6590 "/sessions/Failsafe/IsFailsafe"
+(gdb) 
+#+end_src
+
+Looks like the keys in our properties hashtable are being treated as values
+when the conversion from glib types to scm happens inside ~gig_argument_c_to_scm~.
+looking at the source of ~c_hash_pointer_to_arg~ it becomes apparent why
+#+begin_src c
+// This procedure converts a GHashTable's key or value to a
+// GIArgument.
+static void
+c_hash_pointer_to_arg(GigTypeMeta *meta, gpointer *p, GIArgument *arg)
+{
+    if (!meta->is_ptr) {
+        if (meta->gtype == G_TYPE_INT && meta->item_size <= 4) {
+            // 4-byte INT types are packed into the pointer storage,
+            // but with intptr_t sign extension.
+            gint x = GPOINTER_TO_INT(p);
+            if (meta->item_size == 1)
+                arg->v_int8 = x;
+            else if (meta->item_size == 2)
+                arg->v_int16 = x;
+            else if (meta->item_size == 4)
+                arg->v_int32 = x;
+            else
+                g_assert_not_reached();
+        }
+        // 8-byte INT, INT64, DOUBLE and FLOAT are stored by
+        // reference, even if they would fit in a pointer.
+        else if (meta->gtype == G_TYPE_INT || meta->gtype == G_TYPE_INT64)
+            arg->v_int64 = *(gint64 *)p;
+        else if (meta->gtype == G_TYPE_UINT || meta->gtype == G_TYPE_UINT64)
+            arg->v_uint64 = *(guint64 *)p;
+        else if (meta->gtype == G_TYPE_FLOAT)
+            arg->v_float = *(gfloat *)p;
+        else if (meta->gtype == G_TYPE_DOUBLE)
+            arg->v_double = *(gdouble *)p;
+    }
+    else {
+        if (meta->gtype == G_TYPE_STRING)
+            arg->v_string = (gchar *)p;
+        else
+            arg->v_pointer = p;
+    }
+}
+#+end_src
+~c_hash_pointer_to_arg~ checks for fundamental values like int, bool, string but not for
+the generic container type GValue causing nothing to happen and no error to be reported
+which is when a (char*) get treated as a GValue inside ~gig_argument_c_to_scm~ causing an
+access violation.
+
+[fn:1] These files usually live in the user's home directory prepended by a . causing them
+   to be hidden by default when traversing directories.
+[fn:2] I used to use arch btw...
+[fn:3] Lesson read your man pages and help|h|? messages carefully before losing a bunch of your time.
